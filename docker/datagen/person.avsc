@@ -1,0 +1,34 @@
+{
+  "type": "record",
+  "name": "Person",
+  "namespace": "com.example",
+  "fields": [
+    {
+      "name": "name",
+      "type": {
+        "type": "string",
+        "arg.properties": {
+          "options": ["Alice", "Bob", "Charlie", "Diana", "Eve"]
+        }
+      }
+    },
+    {
+      "name": "age",
+      "type": {
+        "type": "int",
+        "arg.properties": {
+          "range": { "min": 18, "max": 80 }
+        }
+      }
+    },
+    {
+      "name": "city",
+      "type": {
+        "type": "string",
+        "arg.properties": {
+          "options": ["New York", "London", "Tokyo", "Paris", "Berlin"]
+        }
+      }
+    }
+  ]
+}

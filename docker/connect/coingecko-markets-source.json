@@ -1,0 +1,22 @@
+{
+  "name": "coingecko-source",
+  "config": {
+    "connector.class": "com.stitch80.connect.coingecko.CoinGeckoSourceConnector",
+    "tasks.max": "1",
+
+    "coingecko.api.key": "{{COINGECKO_API_KEY}}",
+    "coingecko.coin.ids": "bitcoin,ethereum,solana",
+    "coingecko.vs.currency": "usd",
+    "coingecko.topic.prefix": "raw.coingecko",
+    "coingecko.poll.interval.ms": "60000",
+    "coingecko.endpoints": "markets,simple_price,coin_detail",
+    "coingecko.markets.per.page": "250",
+    "coingecko.rate.limit.calls.per.minute": "25",
+    "coingecko.request.timeout.ms": "30000",
+    "coingecko.coin.detail.poll.interval.ms": "3600000",
+
+    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "io.confluent.connect.avro.AvroConverter",
+    "value.converter.schema.registry.url": "http://schema-registry-local:8081"
+  }
+}

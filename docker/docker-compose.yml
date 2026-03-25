@@ -1,0 +1,420 @@
+name: dataflowlab
+
+# Full stack: 3-node Kafka cluster + Schema Registry + Kafka Connect + monitoring + apps.
+#
+# Profiles:
+#   full-cluster  — all services (3 Connect, 2 Schema Registry, ES, Kibana, Dejavu, ...)
+#   mini-cluster  — minimal set (1 Connect, 1 Schema Registry, no Kibana/Dejavu)
+#
+# Usage:
+#   cp .env.example .env   # then fill in your values
+#   docker compose --profile full-cluster up -d     # everything
+#   docker compose --profile mini-cluster up -d     # lightweight
+#   # After kafka-connect is healthy:
+#   ./connect/register-coingecko-source.sh
+
+x-kafka-common-env: &kafka-common-env
+  KAFKA_KRAFT_CLUSTER_ID: ${KAFKA_KRAFT_CLUSTER_ID:?set in .env}
+  KAFKA_CFG_PROCESS_ROLES: controller,broker
+  KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+  KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT,PLAINTEXT:PLAINTEXT
+  KAFKA_CFG_LISTENERS: PLAINTEXT://:9090,CONTROLLER://:9091,EXTERNAL://:9092
+  KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "false"
+  KAFKA_CFG_LOG_DELETE_RETENTION_MS: "2592000000"
+  # Kafka 4.0 (KIP-1030) changed the default for message.timestamp.after.max.ms
+  # from Long.MAX_VALUE to 3600000 (1 hour). This rejects records with timestamps
+  # more than 1 hour in the future. For historical data reprocessing, records carry
+  # candle close times from years ago; set to Long.MAX_VALUE to allow any timestamp.
+  KAFKA_CFG_LOG_MESSAGE_TIMESTAMP_AFTER_MAX_MS: "9223372036854775807"
+  HOST_EXTERNAL: ${HOST_EXTERNAL:-host.docker.internal}
+
+x-kafka-common: &kafka-common
+  image: bitnamilegacy/kafka:latest
+  restart: unless-stopped
+  healthcheck:
+    test:
+      - CMD-SHELL
+      - bash -c 'exec 3<>/dev/tcp/127.0.0.1/9090'
+    interval: 10s
+    timeout: 3s
+    retries: 20
+
+x-schema-registry-common: &schema-registry-common
+  image: confluentinc/cp-schema-registry:7.9.0
+  depends_on:
+    kafka-1-local:
+      condition: service_healthy
+    kafka-2-local:
+      condition: service_healthy
+    kafka-3-local:
+      condition: service_healthy
+  environment: &schema-registry-common-env
+    SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka-1-local:9090,kafka-2-local:9090,kafka-3-local:9090
+    SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+  healthcheck:
+    test: [ "CMD-SHELL", "curl -f http://localhost:8081/subjects || exit 1" ]
+    interval: 10s
+    timeout: 5s
+    retries: 10
+    start_period: 30s
+
+x-kafka-connect-common-env: &kafka-connect-common-env
+  CLASSPATH: "/etc/kafka-connect/schemas"
+  CONNECT_BOOTSTRAP_SERVERS: kafka-1-local:9090,kafka-2-local:9090,kafka-3-local:9090
+  CONNECT_REST_PORT: 8083
+
+  CONNECT_GROUP_ID: "trading-connect"
+  CONNECT_CONFIG_STORAGE_TOPIC: "_connect-configs"
+  CONNECT_OFFSET_STORAGE_TOPIC: "_connect-offsets"
+  CONNECT_STATUS_STORAGE_TOPIC: "_connect-status"
+  CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-3}
+  CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-3}
+  CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-3}
+
+  CONNECT_KEY_CONVERTER: "org.apache.kafka.connect.storage.StringConverter"
+  CONNECT_VALUE_CONVERTER: "io.confluent.connect.avro.AvroConverter"
+  CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry-local:8081
+
+  CONNECT_PLUGIN_PATH: "/usr/share/java,/usr/share/confluent-hub-components"
+
+x-kafka-connect-common: &kafka-connect-common
+  image: confluentinc/cp-kafka-connect:7.9.0
+  restart: unless-stopped
+  volumes:
+    - ./datagen/person.avsc:/etc/kafka-connect/schemas/person.avsc #For Datagen Source connector
+  command:
+    - bash
+    - -c
+    - |
+      echo "Installing JDBC Sink connector..."
+      confluent-hub install --no-prompt confluentinc/kafka-connect-jdbc:latest
+      echo "Installing Datagen Source connector..."
+      confluent-hub install --no-prompt confluentinc/kafka-connect-datagen:latest
+      echo "Installing Elasticsearch Sink connector..."
+      confluent-hub install --no-prompt confluentinc/kafka-connect-elasticsearch:latest
+      echo "Installing FileStream connectors..."
+      mkdir -p /usr/share/confluent-hub-components/kafka-connect-file
+      curl -sL -o /usr/share/confluent-hub-components/kafka-connect-file/connect-file-3.7.0.jar \
+        https://repo1.maven.org/maven2/org/apache/kafka/connect-file/3.7.0/connect-file-3.7.0.jar
+      echo "Starting Kafka Connect..."
+      /etc/confluent/docker/run
+  depends_on:
+    kafka-1-local:
+      condition: service_healthy
+    kafka-2-local:
+      condition: service_healthy
+    kafka-3-local:
+      condition: service_healthy
+    schema-registry-1-local:
+      condition: service_healthy
+    postgres-local:
+      condition: service_healthy
+    elasticsearch-local:
+      condition: service_healthy
+  healthcheck:
+    test: [ "CMD-SHELL", "curl -f http://localhost:8083/connectors || exit 1" ]
+    interval: 15s
+    timeout: 10s
+    retries: 10
+    start_period: 60s
+
+services:
+  # ── Kafka Node 1 ──
+  kafka-1-local:
+    <<: *kafka-common
+    profiles: [ "full-cluster", "mini-cluster" ]
+    container_name: kafka-1-local
+    hostname: kafka-1-local
+    environment:
+      <<: *kafka-common-env
+      KAFKA_CFG_NODE_ID: "1"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@kafka-1-local:9091,2@kafka-2-local:9091,3@kafka-3-local:9091
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1-local:9090,EXTERNAL://${HOST_EXTERNAL}:19092
+    ports:
+      - "19092:9092"
+    volumes:
+      - kafka-1-data-local:/bitnami/kafka
+
+  # ── Kafka Node 2 ──
+  kafka-2-local:
+    <<: *kafka-common
+    profiles: [ "full-cluster", "mini-cluster" ]
+    container_name: kafka-2-local
+    hostname: kafka-2-local
+    environment:
+      <<: *kafka-common-env
+      KAFKA_CFG_NODE_ID: "2"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@kafka-1-local:9091,2@kafka-2-local:9091,3@kafka-3-local:9091
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2-local:9090,EXTERNAL://${HOST_EXTERNAL}:19094
+    ports:
+      - "19094:9092"
+    volumes:
+      - kafka-2-data-local:/bitnami/kafka
+    depends_on:
+      - kafka-1-local
+
+  # ── Kafka Node 3 ──
+  kafka-3-local:
+    <<: *kafka-common
+    profiles: [ "full-cluster", "mini-cluster" ]
+    container_name: kafka-3-local
+    hostname: kafka-3-local
+    environment:
+      <<: *kafka-common-env
+      KAFKA_CFG_NODE_ID: "3"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@kafka-1-local:9091,2@kafka-2-local:9091,3@kafka-3-local:9091
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka-3-local:9090,EXTERNAL://${HOST_EXTERNAL}:19096
+    ports:
+      - "19096:9092"
+    volumes:
+      - kafka-3-data-local:/bitnami/kafka
+    depends_on:
+      - kafka-1-local
+      - kafka-2-local
+
+  # ── Schema Registry Cluster (2-node) ──
+  # Both nodes share the network alias "schema-registry-local" so existing
+  # references (Connect, Conduktor) resolve via Docker DNS round-robin.
+  schema-registry-1-local:
+    <<: *schema-registry-common
+    profiles: [ "full-cluster", "mini-cluster" ]
+    container_name: schema-registry-1-local
+    hostname: schema-registry-1-local
+    ports:
+      - "18081:8081"
+    networks:
+      default:
+        aliases:
+          - schema-registry-local
+    environment:
+      <<: *schema-registry-common-env
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry-1-local
+
+  schema-registry-2-local:
+    <<: *schema-registry-common
+    profiles: [ "full-cluster" ]
+    container_name: schema-registry-2-local
+    hostname: schema-registry-2-local
+    ports:
+      - "18082:8081"
+    networks:
+      default:
+        aliases:
+          - schema-registry-local
+    environment:
+      <<: *schema-registry-common-env
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry-2-local
+
+  # ── Kafka Connect Cluster (3-node) ──
+  kafka-connect-1-local:
+    <<: *kafka-connect-common
+    profiles: [ "full-cluster", "mini-cluster" ]
+    container_name: kafka-connect-1-local
+    hostname: kafka-connect-1-local
+    ports:
+      - "18083:8083"
+    environment:
+      <<: *kafka-connect-common-env
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect-1-local
+
+  kafka-connect-2-local:
+    <<: *kafka-connect-common
+    profiles: [ "full-cluster" ]
+    container_name: kafka-connect-2-local
+    hostname: kafka-connect-2-local
+    ports:
+      - "18084:8083"
+    environment:
+      <<: *kafka-connect-common-env
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect-2-local
+    depends_on:
+      kafka-1-local:
+        condition: service_healthy
+      kafka-2-local:
+        condition: service_healthy
+      kafka-3-local:
+        condition: service_healthy
+      schema-registry-1-local:
+        condition: service_healthy
+      postgres-local:
+        condition: service_healthy
+      elasticsearch-local:
+        condition: service_healthy
+      kafka-connect-1-local:
+        condition: service_healthy
+
+  kafka-connect-3-local:
+    <<: *kafka-connect-common
+    profiles: [ "full-cluster" ]
+    container_name: kafka-connect-3-local
+    hostname: kafka-connect-3-local
+    ports:
+      - "18085:8083"
+    environment:
+      <<: *kafka-connect-common-env
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect-3-local
+    depends_on:
+      kafka-1-local:
+        condition: service_healthy
+      kafka-2-local:
+        condition: service_healthy
+      kafka-3-local:
+        condition: service_healthy
+      schema-registry-1-local:
+        condition: service_healthy
+      postgres-local:
+        condition: service_healthy
+      elasticsearch-local:
+        condition: service_healthy
+      kafka-connect-1-local:
+        condition: service_healthy
+      kafka-connect-2-local:
+        condition: service_healthy
+
+  # ── Conduktor PostgreSQL ──
+  cdk-postgres-local:
+    image: postgres
+    profiles: [ "full-cluster", "mini-cluster" ]
+    container_name: conduktor-postgres-local
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${CDK_POSTGRES_DB:-conduktor-platform}
+      POSTGRES_USER: ${CDK_POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${CDK_POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+    volumes:
+      - cdk_pg_data-local:/var/lib/postgresql
+
+  # ── Conduktor Platform ──
+  conduktor-platform-local:
+    image: conduktor/conduktor-console
+    profiles: [ "full-cluster", "mini-cluster" ]
+    container_name: conduktor-platform-local
+    restart: unless-stopped
+    depends_on:
+      - cdk-postgres-local
+      - kafka-1-local
+    ports:
+      - "18088:8080"
+    volumes:
+      - conduktor_data-local:/var/conduktor
+    environment:
+      CDK_DATABASE_URL: postgresql://${CDK_POSTGRES_USER}:${CDK_POSTGRES_PASSWORD}@cdk-postgres-local:5432/${CDK_POSTGRES_DB:-conduktor-platform}
+      CDK_MONITORING_CORTEX-URL: http://conduktor-monitoring-local:9009/
+      CDK_MONITORING_ALERT-MANAGER-URL: http://conduktor-monitoring-local:9010/
+      CDK_MONITORING_CALLBACK-URL: http://conduktor-platform-local:8080/monitoring/api/
+      CDK_MONITORING_NOTIFICATIONS-CALLBACK-URL: http://localhost:18088
+
+  # ── Conduktor Monitoring ──
+  conduktor-monitoring-local:
+    image: conduktor/conduktor-console-cortex
+    profiles: [ "full-cluster", "mini-cluster" ]
+    container_name: conduktor-monitoring-local
+    restart: unless-stopped
+    environment:
+      CDK_CONSOLE-URL: http://conduktor-platform-local:8080
+
+  # ── Elasticsearch ──
+  elasticsearch-local:
+    image: elasticsearch:7.17.27
+    profiles: [ "full-cluster", "mini-cluster" ]
+    container_name: elasticsearch-local
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms256m -Xmx256m"
+      http.cors.enabled: "true"
+      http.cors.allow-origin: "*"
+      http.cors.allow-headers: "X-Requested-With,X-Auth-Token,Content-Type,Content-Length,Authorization"
+      http.cors.allow-credentials: "true"
+    mem_limit: 512m
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── Kibana UI for Elasticsearch ──
+  kibana-local:
+    image: kibana:7.17.27
+    profiles: [ "full-cluster" ]
+    container_name: kibana-local
+    ports:
+      - "5601:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch-local:9200
+    depends_on:
+      elasticsearch-local:
+        condition: service_healthy
+
+  # ── Dejavu UI for Elasticsearch ──
+  dejavu-local:
+    image: appbaseio/dejavu
+    profiles: [ "full-cluster" ]
+    container_name: dejavu-local
+    ports:
+      - "1358:1358"
+    depends_on:
+      elasticsearch-local:
+        condition: service_healthy
+
+  # ── PostgreSQL ──
+  postgres-local:
+    image: postgres
+    profiles: [ "full-cluster", "mini-cluster" ]
+    container_name: postgres-local
+    environment:
+      POSTGRES_USER: $POSTGRES_USER
+      POSTGRES_PASSWORD: $POSTGRES_PASSWORD
+      POSTGRES_DB: postgres
+    ports:
+      - 5433:5432
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Crypto Streams Analytics (Kafka Streams) ──
+  # Build the image first: cd ../crypto-streams-analytics && ./build-image.sh
+  crypto-streams-analytics:
+    image: crypto-streams-analytics:latest
+    profiles: [ "full-cluster", "mini-cluster" ]
+    container_name: crypto-streams-analytics
+    depends_on:
+      kafka-1-local:
+        condition: service_healthy
+      kafka-2-local:
+        condition: service_healthy
+      kafka-3-local:
+        condition: service_healthy
+      schema-registry-1-local:
+        condition: service_healthy
+    environment:
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka-1-local:9090,kafka-2-local:9090,kafka-3-local:9090
+      SPRING_KAFKA_STREAMS_BOOTSTRAP_SERVERS: kafka-1-local:9090,kafka-2-local:9090,kafka-3-local:9090
+      SPRING_KAFKA_STREAMS_PROPERTIES_SCHEMA_REGISTRY_URL: http://schema-registry-local:8081
+    ports:
+      - "8085:8080"
+    restart: unless-stopped
+
+volumes:
+  kafka-1-data-local:
+    name: dataflowlab_kafka-1-data-local
+    external: true
+  kafka-2-data-local:
+    name: dataflowlab_kafka-2-data-local
+    external: true
+  kafka-3-data-local:
+    name: dataflowlab_kafka-3-data-local
+    external: true
+  cdk_pg_data-local:
+    name: dataflowlab_cdk_pg_data-local
+    external: true
+  conduktor_data-local:
+    name: dataflowlab_conduktor_data-local
+    external: true

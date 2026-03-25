@@ -1,0 +1,23 @@
+# Credentials (real .env is git-ignored, .env.example is committed)
+docker/.env
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Terraform
+*.tfstate
+*.tfstate.backup
+.terraform/
+
+# Kubernetes secrets
+*-secret.yaml
+*-secret.yml
